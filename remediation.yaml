@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda-based GuardDuty SSH Brute Force Remediation with SNS Alert
+
+Parameters:
+  LinuxTargetSecurityGroupId:
+    Type: String
+    Description: Security Group ID to be modified (from infra stack)
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to notify on threat detection
+
+Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "GuardDuty Alerts"
+
+  SNSEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref NotificationTopic
+
+  RemediationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RemediationPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  RemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sshRemediationLambda
+      Runtime: python3.9
+      Role: !GetAtt RemediationLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          TARGET_SG_ID: !Ref LinuxTargetSecurityGroupId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              finding = event['detail'].get('service', {}).get('action', {}).get('networkConnectionAction', {})
+              ip = finding.get('remoteIpDetails', {}).get('ipAddressV4')
+
+              if not ip:
+                  print('No IP address found in the event.')
+                  return
+
+              sg_id = os.environ['TARGET_SG_ID']
+              print(f"Blocking IP {ip} in SG {sg_id}")
+
+              ec2.revoke_security_group_ingress(
+                  GroupId=sg_id,
+                  IpProtocol='tcp',
+                  FromPort=22,
+                  ToPort=22,
+                  CidrIp=f"{ip}/32"
+              )
+
+              message = f"GuardDuty detected SSH brute force from {ip}. Blocked via Lambda."
+              print(message)
+              sns.publish(
+                  TopicArn='${NotificationTopic}',
+                  Message=message,
+                  Subject='GuardDuty SSH Remediation Triggered'
+              )
+              return {'statusCode': 200, 'body': message}
+
+  GuardDutyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SSHBruteForceRemediationRule
+      Description: Triggers Lambda and SNS on GuardDuty SSH brute force attacks
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - numeric: [">", 5]
+          type:
+            - prefix: "UnauthorizedAccess:EC2/SSHBruteForce"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RemediationLambda.Arn
+          Id: SSHRemediationLambdaTarget
+        - Arn: !Ref NotificationTopic
+          Id: NotifySecurityTeam
+
+  RemediationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyEventRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the GuardDuty Remediation Lambda
+    Value: !GetAtt RemediationLambda.Arn
+
+  NotificationTopicArn:
+    Description: ARN of the SNS Topic for Security Team Alerts
+    Value: !Ref NotificationTopic
