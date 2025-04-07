@@ -1,0 +1,26 @@
+# Git directory
+.git
+
+# macOS system files
+.DS_Store
+
+# CloudFormation artifacts
+*.yaml-compiled
+*.template-compiled
+
+# IDE and editor files
+.vscode/
+
+# Python (if using Python for Lambda functions or CDK)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt

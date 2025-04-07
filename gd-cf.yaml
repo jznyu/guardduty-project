@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Minimal GuardDuty Test Environment for SSH Brute Force Detection Only
+
+Parameters:
+  AvailabilityZones:
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+  VPCCIDR:
+    Type: String
+    Default: 172.16.0.0/24
+  PublicSubnetCIDR:
+    Type: String
+    Default: 172.16.0.0/25
+  PrivateSubnetCIDR:
+    Type: String
+    Default: 172.16.0.128/25
+  RemoteAccessCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+  LatestLinuxAMI:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCIDR
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCIDR
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from Internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref RemoteAccessCIDR
+
+  LinuxTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from RedTeam
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref RedTeamSecurityGroup
+
+  RedTeamSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow RedTeam communication
+      VpcId: !Ref VPC
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      ImageId: !Ref LatestLinuxAMI
+      SecurityGroupIds: [ !Ref BastionSecurityGroup ]
+      Tags:
+        - Key: Name
+          Value: BastionHost
+
+  RedTeamInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnet
+      ImageId: !Ref LatestLinuxAMI
+      SecurityGroupIds: [ !Ref RedTeamSecurityGroup ]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y git nmap hydra
+          curl -L -o /home/ec2-user/guardduty_tester.sh \
+            https://raw.githubusercontent.com/awslabs/amazon-guardduty-tester/master/guardduty_tester.sh
+          chmod +x /home/ec2-user/guardduty_tester.sh
+
+  LinuxTargetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnet
+      ImageId: !Ref LatestLinuxAMI
+      SecurityGroupIds: [ !Ref LinuxTargetSecurityGroup ]
+      Tags:
+        - Key: Name
+          Value: LinuxTarget
+
+Outputs:
+  LinuxTargetSecurityGroupId:
+    Description: Security Group ID of the Linux Target (used in Lambda remediation)
+    Value: !Ref LinuxTargetSecurityGroup
+  RedTeamInstanceId:
+    Description: EC2 Instance ID of RedTeam (attacker)
+    Value: !Ref RedTeamInstance
