@@ -100,8 +100,13 @@ Resources:
   RedTeamSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow RedTeam communication
+      GroupDescription: Allow SSH from BastionHost
       VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
 
   BastionHost:
     Type: AWS::EC2::Instance
@@ -123,6 +128,9 @@ Resources:
       SubnetId: !Ref PrivateSubnet
       ImageId: !Ref LatestLinuxAMI
       SecurityGroupIds: [ !Ref RedTeamSecurityGroup ]
+      Tags:
+        - Key: Name
+          Value: RedTeamInstance
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -148,6 +156,8 @@ Outputs:
   LinuxTargetSecurityGroupId:
     Description: Security Group ID of the Linux Target (used in Lambda remediation)
     Value: !Ref LinuxTargetSecurityGroup
+    Export:
+      Name: LinuxTargetSecurityGroupId
   RedTeamInstanceId:
     Description: EC2 Instance ID of RedTeam (attacker)
     Value: !Ref RedTeamInstance

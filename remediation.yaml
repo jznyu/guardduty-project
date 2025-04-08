@@ -2,10 +2,6 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Lambda-based GuardDuty SSH Brute Force Remediation with SNS Alert
 
 Parameters:
-  LinuxTargetSecurityGroupId:
-    Type: String
-    Description: Security Group ID to be modified (from infra stack)
-
   NotificationEmail:
     Type: String
     Description: Email address to notify on threat detection
@@ -18,6 +14,13 @@ Resources:
       Subscription:
         - Protocol: email
           Endpoint: !Ref NotificationEmail
+
+  LinuxTargetSecurityGroupId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: LinuxTargetSecurityGroupId
+      Type: String
+      Value: !ImportValue LinuxTargetSecurityGroupId
 
   RemediationLambdaRole:
     Type: AWS::IAM::Role
