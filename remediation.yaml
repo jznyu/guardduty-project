@@ -15,13 +15,9 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       DisplayName: "GuardDuty Alerts"
-
-  SNSEmailSubscription:
-    Type: AWS::SNS::Subscription
-    Properties:
-      Protocol: email
-      Endpoint: !Ref NotificationEmail
-      TopicArn: !Ref NotificationTopic
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
 
   RemediationLambdaRole:
     Type: AWS::IAM::Role
@@ -50,6 +46,10 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
 
   RemediationLambda:
     Type: AWS::Lambda::Function
@@ -62,8 +62,10 @@ Resources:
       Environment:
         Variables:
           TARGET_SG_ID: !Ref LinuxTargetSecurityGroupId
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
       Code:
         ZipFile: |
+          import os
           import json
           import boto3
 
@@ -92,7 +94,7 @@ Resources:
               message = f"GuardDuty detected SSH brute force from {ip}. Blocked via Lambda."
               print(message)
               sns.publish(
-                  TopicArn='${NotificationTopic}',
+                  TopicArn=os.environ['NOTIFICATION_TOPIC'],
                   Message=message,
                   Subject='GuardDuty SSH Remediation Triggered'
               )
