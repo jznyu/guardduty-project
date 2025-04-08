@@ -5,6 +5,7 @@ Description: >
 Parameters:
   AvailabilityZones:
     Type: List<AWS::EC2::AvailabilityZone::Name>
+    Default: us-east-1a
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
   VPCCIDR:
@@ -128,7 +129,7 @@ Resources:
           yum update -y
           yum install -y git nmap hydra
           curl -L -o /home/ec2-user/guardduty_tester.sh \
-            https://raw.githubusercontent.com/awslabs/amazon-guardduty-tester/master/guardduty_tester.sh
+            https://raw.githubusercontent.com/awslabs/amazon-guardduty-tester/9ed7b5f6057bda5cbf7ac3608555fe36e7a7c5fe/guardduty_tester.sh
           chmod +x /home/ec2-user/guardduty_tester.sh
 
   LinuxTargetInstance:
