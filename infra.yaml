@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >
-  Minimal GuardDuty Test Environment for SSH Brute Force Detection Only
+  Minimal GuardDuty Test Environment with NAT Gateway for RedTeam Internet Access
 
 Parameters:
   AvailabilityZones:
@@ -56,6 +56,17 @@ Resources:
       CidrBlock: !Ref PrivateSubnetCIDR
       AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
 
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -74,6 +85,24 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
 
   BastionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -119,6 +148,11 @@ Resources:
       Tags:
         - Key: Name
           Value: BastionHost
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y nmap-ncat
 
   RedTeamInstance:
     Type: AWS::EC2::Instance
@@ -135,10 +169,13 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           yum update -y
-          yum install -y git nmap hydra
+          yum install -y git nmap hydra nc unzip python3
+          pip3 install paramiko
+          git clone https://github.com/galkan/crowbar /home/ec2-user/crowbar
           curl -L -o /home/ec2-user/guardduty_tester.sh \
             https://raw.githubusercontent.com/awslabs/amazon-guardduty-tester/9ed7b5f6057bda5cbf7ac3608555fe36e7a7c5fe/guardduty_tester.sh
           chmod +x /home/ec2-user/guardduty_tester.sh
+          chmod +x /home/ec2-user/crowbar/crowbar.py
 
   LinuxTargetInstance:
     Type: AWS::EC2::Instance
@@ -158,6 +195,7 @@ Outputs:
     Value: !Ref LinuxTargetSecurityGroup
     Export:
       Name: LinuxTargetSecurityGroupId
+
   RedTeamInstanceId:
     Description: EC2 Instance ID of RedTeam (attacker)
     Value: !Ref RedTeamInstance
