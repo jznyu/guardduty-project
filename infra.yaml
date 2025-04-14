@@ -200,7 +200,7 @@ Resources:
 
               # Download the full GuardDuty tester script
               curl -L -o /home/ec2-user/guardduty_tester.sh \
-                https://raw.githubusercontent.com/awslabs/amazon-guardduty-tester/9ed7b5f6057bda5cbf7ac3608555fe36e7a7c5fe/guardduty_tester.sh
+                https://github.com/jznyu/guardduty-project/blob/main/guardduty_tester.sh
               chmod +x /home/ec2-user/guardduty_tester.sh
 
               # Fix ownership
