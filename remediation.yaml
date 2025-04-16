@@ -15,13 +15,6 @@ Resources:
         - Protocol: email
           Endpoint: !Ref NotificationEmail
 
-  LinuxTargetSecurityGroupId:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: LinuxTargetSecurityGroupId
-      Type: String
-      Value: !ImportValue LinuxTargetSecurityGroupId
-
   RemediationLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -64,7 +57,7 @@ Resources:
       Timeout: 60
       Environment:
         Variables:
-          TARGET_SG_ID: !Ref LinuxTargetSecurityGroupId
+          TARGET_SG_ID: !ImportValue LinuxTargetSecurityGroupId
           NOTIFICATION_TOPIC: !Ref NotificationTopic
       Code:
         ZipFile: |
