@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >
-  Minimal GuardDuty Test Environment with NAT Gateway for RedTeam Internet Access
+  Minimal GuardDuty Test Environment with NAT Gateway for RedTeam Internet Access (NACL-based remediation)
 
 Parameters:
   AvailabilityZones:
@@ -56,53 +56,33 @@ Resources:
       CidrBlock: !Ref PrivateSubnetCIDR
       AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
 
-  EIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-
-  NATGateway:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt EIP.AllocationId
-      SubnetId: !Ref PublicSubnet
-
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
+  PublicSubnetNACL:
+    Type: AWS::EC2::NetworkAcl
     Properties:
       VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicSubnetNACL
 
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: VPCGatewayAttachment
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  PublicSubnetRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
-
-  PrivateRouteTable:
-    Type: AWS::EC2::RouteTable
+  PrivateSubnetNACL:
+    Type: AWS::EC2::NetworkAcl
     Properties:
       VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetNACL
 
-  PrivateRoute:
-    Type: AWS::EC2::Route
+  PublicSubnetNACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
     Properties:
-      RouteTableId: !Ref PrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NATGateway
+      SubnetId: !Ref PublicSubnet
+      NetworkAclId: !Ref PublicSubnetNACL
 
-  PrivateSubnetRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
+  PrivateSubnetNACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet
-      RouteTableId: !Ref PrivateRouteTable
+      NetworkAclId: !Ref PrivateSubnetNACL
 
   BastionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -114,17 +94,6 @@ Resources:
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref RemoteAccessCIDR
-
-  LinuxTargetSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow SSH from RedTeam
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          SourceSecurityGroupId: !Ref RedTeamSecurityGroup
 
   RedTeamSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -171,42 +140,22 @@ Resources:
             - |
               #!/bin/bash
               set -xe
-
-              # Avoid failing on update timeout
-              yum update -y || echo "yum update failed, continuing anyway"
-
-              # Proceed with installation
-              yum install -y git nmap nc python3 || echo "yum install failed"
-
-              # Install pip + paramiko
+              yum update -y || echo "yum update failed, continuing"
+              yum install -y git nmap nc python3
               python3 -m ensurepip --upgrade
-              /usr/local/bin/pip3 install --upgrade pip
-              /usr/local/bin/pip3 install paramiko
-
-              # Clone crowbar
+              pip3 install paramiko
               git clone https://github.com/galkan/crowbar /home/ec2-user/crowbar
               chmod +x /home/ec2-user/crowbar/crowbar.py
-
-              # Create dummy compromised keys
               mkdir -p /home/ec2-user/compromised_keys
               echo "FAKE_KEY" > /home/ec2-user/compromised_keys/fakekey.pem
-              for i in {1..20}; do
-                cp /home/ec2-user/compromised_keys/fakekey.pem /home/ec2-user/compromised_keys/compromised$i.pem
-              done
-
-              # Inject IPs into sourced file
+              for i in {1..20}; do cp /home/ec2-user/compromised_keys/fakekey.pem /home/ec2-user/compromised_keys/compromised$i.pem; done
               echo 'BASIC_LINUX_TARGET="${LinuxTargetIP}"' > /home/ec2-user/localIps.sh
               echo "RED_TEAM_IP=\"$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)\"" >> /home/ec2-user/localIps.sh
-
-              # Download the full GuardDuty tester script
-              curl -L -o /home/ec2-user/guardduty_tester.sh \
-                https://raw.githubusercontent.com/jznyu/guardduty-project/main/guardduty_tester.sh
+              curl -L -o /home/ec2-user/guardduty_tester.sh https://raw.githubusercontent.com/jznyu/guardduty-project/main/guardduty_tester.sh
               chmod +x /home/ec2-user/guardduty_tester.sh
-
-              # Fix ownership
               chown -R ec2-user:ec2-user /home/ec2-user
-            - LinuxTargetIP: 
-                Fn::GetAtt: 
+            - LinuxTargetIP:
+                Fn::GetAtt:
                   - LinuxTargetInstance
                   - PrivateIp
 
@@ -217,18 +166,24 @@ Resources:
       KeyName: !Ref KeyPairName
       SubnetId: !Ref PrivateSubnet
       ImageId: !Ref LatestLinuxAMI
-      SecurityGroupIds: [ !Ref LinuxTargetSecurityGroup ]
+      SecurityGroupIds: [ !Ref BastionSecurityGroup ]
       Tags:
         - Key: Name
           Value: LinuxTarget
 
 Outputs:
-  LinuxTargetSecurityGroupId:
-    Description: Security Group ID of the Linux Target (used in Lambda remediation)
-    Value: !Ref LinuxTargetSecurityGroup
-    Export:
-      Name: LinuxTargetSecurityGroupId
-
   RedTeamInstanceId:
-    Description: EC2 Instance ID of RedTeam (attacker)
+    Description: EC2 Instance ID of RedTeam
     Value: !Ref RedTeamInstance
+
+  RedTeamPrivateIP:
+    Description: Private IP of RedTeamInstance
+    Value: !GetAtt RedTeamInstance.PrivateIp
+    Export:
+      Name: RedTeamPrivateIP
+
+  PrivateNACLId:
+    Description: ID of the private subnet's NACL
+    Value: !Ref PrivateSubnetNACL
+    Export:
+      Name: PrivateNACLId

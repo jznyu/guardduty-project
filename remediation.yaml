@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Lambda-based GuardDuty SSH Brute Force Remediation with SNS Alert
+Description: Lambda-based GuardDuty SSH Brute Force Remediation using NACL and SNS Alert
 
 Parameters:
   NotificationEmail:
@@ -33,15 +33,15 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - ec2:RevokeSecurityGroupIngress
-                  - ec2:DescribeSecurityGroups
+                  - ec2:CreateNetworkAclEntry
+                  - ec2:DescribeNetworkAcls
                 Resource: "*"
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "arn:aws:logs:*:*:*"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${RemediationLambda}:*"
               - Effect: Allow
                 Action:
                   - sns:Publish
@@ -50,14 +50,14 @@ Resources:
   RemediationLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: sshRemediationLambda
+      FunctionName: sshNACLRemediationLambda
       Runtime: python3.9
       Role: !GetAtt RemediationLambdaRole.Arn
       Handler: index.lambda_handler
       Timeout: 60
       Environment:
         Variables:
-          TARGET_SG_ID: !ImportValue LinuxTargetSecurityGroupId
+          TARGET_NACL_ID: !ImportValue PrivateNACLId
           NOTIFICATION_TOPIC: !Ref NotificationTopic
       Code:
         ZipFile: |
@@ -69,31 +69,43 @@ Resources:
           sns = boto3.client('sns')
 
           def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
               finding = event['detail'].get('service', {}).get('action', {}).get('networkConnectionAction', {})
               ip = finding.get('remoteIpDetails', {}).get('ipAddressV4')
 
               if not ip:
-                  print('No IP address found in the event.')
+                  print("No IP address found in the GuardDuty event.")
                   return
 
-              sg_id = os.environ['TARGET_SG_ID']
-              print(f"Blocking IP {ip} in SG {sg_id}")
+              nacl_id = os.environ['TARGET_NACL_ID']
+              print(f"Blocking {ip} in NACL {nacl_id}")
 
-              ec2.revoke_security_group_ingress(
-                  GroupId=sg_id,
-                  IpProtocol='tcp',
-                  FromPort=22,
-                  ToPort=22,
-                  CidrIp=f"{ip}/32"
+              # Dynamically find an available rule number (starts at 100)
+              nacls = ec2.describe_network_acls(NetworkAclIds=[nacl_id])['NetworkAcls']
+              existing_rules = [entry['RuleNumber'] for entry in nacls[0]['Entries']]
+              rule_number = next(i for i in range(100, 32766) if i not in existing_rules)
+
+              ec2.create_network_acl_entry(
+                  NetworkAclId=nacl_id,
+                  RuleNumber=rule_number,
+                  Protocol='6',  # TCP
+                  RuleAction='deny',
+                  Egress=False,
+                  CidrBlock=f"{ip}/32",
+                  PortRange={
+                      'From': 22,
+                      'To': 22
+                  }
               )
 
-              message = f"GuardDuty detected SSH brute force from {ip}. Blocked via Lambda."
+              message = f"GuardDuty detected SSH brute force from {ip}. Blocked via NACL rule #{rule_number}."
               print(message)
               sns.publish(
                   TopicArn=os.environ['NOTIFICATION_TOPIC'],
                   Message=message,
-                  Subject='GuardDuty SSH Remediation Triggered'
+                  Subject='GuardDuty SSH NACL Remediation Triggered'
               )
+
               return {'statusCode': 200, 'body': message}
 
   GuardDutyEventRule:
@@ -117,6 +129,8 @@ Resources:
           Id: SSHRemediationLambdaTarget
         - Arn: !Ref NotificationTopic
           Id: NotifySecurityTeam
+      RetryPolicy:
+        MaximumRetryAttempts: 0
 
   RemediationInvokePermission:
     Type: AWS::Lambda::Permission
