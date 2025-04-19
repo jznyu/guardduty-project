@@ -41,7 +41,7 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${RemediationLambda}:*"
+                Resource: "*"
               - Effect: Allow
                 Action:
                   - sns:Publish
@@ -129,8 +129,6 @@ Resources:
           Id: SSHRemediationLambdaTarget
         - Arn: !Ref NotificationTopic
           Id: NotifySecurityTeam
-      RetryPolicy:
-        MaximumRetryAttempts: 0
 
   RemediationInvokePermission:
     Type: AWS::Lambda::Permission

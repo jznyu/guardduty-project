@@ -31,9 +31,16 @@ Resources:
       CidrBlock: !Ref VPCCIDR
       EnableDnsSupport: true
       EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: nyu-guardduty-vpc
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: nyu-guardduty-igw
 
   VPCGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -48,6 +55,9 @@ Resources:
       CidrBlock: !Ref PublicSubnetCIDR
       AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: nyu-guardduty-public-subnet
 
   PrivateSubnet:
     Type: AWS::EC2::Subnet
@@ -55,14 +65,67 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnetCIDR
       AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+      Tags:
+        - Key: Name
+          Value: nyu-guardduty-private-subnet
 
-  PublicSubnetNACL:
-    Type: AWS::EC2::NetworkAcl
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: nyu-guardduty-nat-gateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: PublicSubnetNACL
+          Value: nyu-guardduty-private-route-table
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: nyu-guardduty-public-route-table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
 
   PrivateSubnetNACL:
     Type: AWS::EC2::NetworkAcl
@@ -71,12 +134,6 @@ Resources:
       Tags:
         - Key: Name
           Value: PrivateSubnetNACL
-
-  PublicSubnetNACLAssociation:
-    Type: AWS::EC2::SubnetNetworkAclAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet
-      NetworkAclId: !Ref PublicSubnetNACL
 
   PrivateSubnetNACLAssociation:
     Type: AWS::EC2::SubnetNetworkAclAssociation
@@ -94,6 +151,17 @@ Resources:
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref RemoteAccessCIDR
+        
+  LinuxTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from RedTeam only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref RedTeamSecurityGroup
 
   RedTeamSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -166,7 +234,7 @@ Resources:
       KeyName: !Ref KeyPairName
       SubnetId: !Ref PrivateSubnet
       ImageId: !Ref LatestLinuxAMI
-      SecurityGroupIds: [ !Ref BastionSecurityGroup ]
+      SecurityGroupIds: [ !Ref LinuxTargetSecurityGroup ]
       Tags:
         - Key: Name
           Value: LinuxTarget
