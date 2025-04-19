@@ -124,7 +124,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          SourceSecurityGroupId: !Ref RedTeamSecurityGroup
+          CidrIp: 0.0.0.0/0 
 
   RedTeamSecurityGroup:
     Type: AWS::EC2::SecurityGroup

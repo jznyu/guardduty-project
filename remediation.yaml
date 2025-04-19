@@ -35,6 +35,7 @@ Resources:
                 Action:
                   - ec2:RevokeSecurityGroupIngress
                   - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
                 Resource: "*"
               - Effect: Allow
                 Action:
@@ -61,40 +62,57 @@ Resources:
           NOTIFICATION_TOPIC: !Ref NotificationTopic
       Code:
         ZipFile: |
-          import os
-          import json
-          import boto3
+          import os, logging, boto3
+          from botocore.config import Config
+          from typing import Optional
 
-          ec2 = boto3.client('ec2')
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          TARGET_SG = os.environ['TARGET_SG_ID']
+          TOPIC_ARN = os.environ['NOTIFICATION_TOPIC']
+          ec2 = boto3.client('ec2', config=Config(retries={'max_attempts': 8}))
           sns = boto3.client('sns')
+          PORT, PROTOCOL, OPEN_CIDR = 22, 'tcp', '0.0.0.0/0'
 
-          def lambda_handler(event, context):
-              finding = event['detail'].get('service', {}).get('action', {}).get('networkConnectionAction', {})
-              ip = finding.get('remoteIpDetails', {}).get('ipAddressV4')
+          def _respond(code: int, msg: str):
+              logger.info(msg)
+              sns.publish(TopicArn=TOPIC_ARN,
+                          Subject=f'SSH Remediation {code}',
+                          Message=msg)
+              return {'statusCode': code, 'body': msg}
 
+          def attacker_ip(event) -> Optional[str]:
+              return (event.get('detail', {})
+                          .get('service', {})
+                          .get('action', {})
+                          .get('networkConnectionAction', {})
+                          .get('remoteIpDetails', {})
+                          .get('ipAddressV4'))
+
+          def lambda_handler(event, _):
+              ip = attacker_ip(event)
               if not ip:
-                  print('No IP address found in the event.')
-                  return
+                  return _respond(400, 'No IP in event')
+              try:
+                  ec2.revoke_security_group_ingress(
+                      GroupId=TARGET_SG,
+                      IpPermissions=[{
+                          'IpProtocol': PROTOCOL,
+                          'FromPort': PORT,
+                          'ToPort': PORT,
+                          'IpRanges': [{'CidrIp': OPEN_CIDR}]
+                      }]
+                  )
+                  return _respond(200,
+                      f'Removed {OPEN_CIDR} rule from {TARGET_SG} (attacker {ip})'
+                  )
+              except ec2.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                      return _respond(200, f'Rule already absent in {TARGET_SG}')
+                  return _respond(500, f'EC2 error: {e}')
+              except Exception as e:
+                  return _respond(500, f'Unexpected error: {e}')
 
-              sg_id = os.environ['TARGET_SG_ID']
-              print(f"Blocking IP {ip} in SG {sg_id}")
-
-              ec2.revoke_security_group_ingress(
-                  GroupId=sg_id,
-                  IpProtocol='tcp',
-                  FromPort=22,
-                  ToPort=22,
-                  CidrIp=f"{ip}/32"
-              )
-
-              message = f"GuardDuty detected SSH brute force from {ip}. Blocked via Lambda."
-              print(message)
-              sns.publish(
-                  TopicArn=os.environ['NOTIFICATION_TOPIC'],
-                  Message=message,
-                  Subject='GuardDuty SSH Remediation Triggered'
-              )
-              return {'statusCode': 200, 'body': message}
 
   GuardDutyEventRule:
     Type: AWS::Events::Rule
