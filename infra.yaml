@@ -126,21 +126,6 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
-
-  PrivateSubnetNACL:
-    Type: AWS::EC2::NetworkAcl
-    Properties:
-      VpcId: !Ref VPC
-      Tags:
-        - Key: Name
-          Value: PrivateSubnetNACL
-
-  PrivateSubnetNACLAssociation:
-    Type: AWS::EC2::SubnetNetworkAclAssociation
-    Properties:
-      SubnetId: !Ref PrivateSubnet
-      NetworkAclId: !Ref PrivateSubnetNACL
-
   BastionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -249,9 +234,3 @@ Outputs:
     Value: !GetAtt RedTeamInstance.PrivateIp
     Export:
       Name: RedTeamPrivateIP
-
-  PrivateNACLId:
-    Description: ID of the private subnet's NACL
-    Value: !Ref PrivateSubnetNACL
-    Export:
-      Name: PrivateNACLId

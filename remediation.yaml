@@ -33,8 +33,10 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - ec2:CreateNetworkAclEntry
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSubnets
                   - ec2:DescribeNetworkAcls
+                  - ec2:CreateNetworkAclEntry
                 Resource: "*"
               - Effect: Allow
                 Action:
@@ -57,7 +59,6 @@ Resources:
       Timeout: 60
       Environment:
         Variables:
-          TARGET_NACL_ID: !ImportValue PrivateNACLId
           NOTIFICATION_TOPIC: !Ref NotificationTopic
       Code:
         ZipFile: |
@@ -68,38 +69,101 @@ Resources:
           ec2 = boto3.client('ec2')
           sns = boto3.client('sns')
 
+          def get_attacker_ip(event):
+              return (event.get('detail', {})
+                          .get('service', {})
+                          .get('action', {})
+                          .get('networkConnectionAction', {})
+                          .get('localIpDetails', {})
+                          .get('ipAddressV4'))
+
+          def get_target_ip(event):
+            return (event.get('detail', {})
+                          .get('service', {})
+                          .get('action', {})
+                          .get('networkConnectionAction', {})
+                          .get('remoteIpDetails', {})
+                          .get('ipAddressV4'))
+
+          def ip_already_blocked(nacl_id, ip):
+            nacl = ec2.describe_network_acls(NetworkAclIds=[nacl_id])['NetworkAcls'][0]
+            for entry in nacl['Entries']:
+                if (entry['RuleAction'] == 'deny' and
+                    entry['Protocol'] == '6' and
+                    entry.get('CidrBlock') == f"{ip}/32" and
+                    entry.get('PortRange', {}).get('From') == 22):
+                    return True
+            return False                
+
+          def get_target_instance_id(event):
+              return event.get('detail', {}).get('resource', {}).get('instanceDetails', {}).get('instanceId')
+
+          def get_subnet_id(instance_id):
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              return response['Reservations'][0]['Instances'][0]['SubnetId']
+
+          def get_nacl_id(subnet_id):
+              nacls = ec2.describe_network_acls()['NetworkAcls']
+              for nacl in nacls:
+                  for assoc in nacl.get('Associations', []):
+                      if assoc['SubnetId'] == subnet_id:
+                          return nacl['NetworkAclId']
+              raise Exception(f"NACL not found for subnet {subnet_id}")
+
+          def find_available_rule_number(nacl_id):
+              nacl = ec2.describe_network_acls(NetworkAclIds=[nacl_id])['NetworkAcls'][0]
+              used_numbers = [entry['RuleNumber'] for entry in nacl['Entries']]
+              for i in range(1, 100):
+                  if i not in used_numbers:
+                      return i
+              raise Exception("No available NACL rule numbers")
+
           def lambda_handler(event, context):
-              print("Received event:", json.dumps(event))
-              finding = event['detail'].get('service', {}).get('action', {}).get('networkConnectionAction', {})
-              ip = finding.get('remoteIpDetails', {}).get('ipAddressV4')
+              attacker_ip = get_attacker_ip(event)
+              target_ip = get_target_ip(event)
+              instance_id = get_target_instance_id(event)
+              if not attacker_ip or not instance_id:
+                  print("Missing attacker IP or instance ID in event.")
+                  return {'statusCode': 400, 'body': 'Invalid GuardDuty event format'}
 
-              if not ip:
-                  print("No IP address found in the GuardDuty event.")
-                  return
+              subnet_id = get_subnet_id(instance_id)
+              nacl_id = get_nacl_id(subnet_id)
+              rule_number = find_available_rule_number(nacl_id)
 
-              nacl_id = os.environ['TARGET_NACL_ID']
-              print(f"Blocking {ip} in NACL {nacl_id}")
+              print("--------------------------------")
+              print(f"nacl_id: {nacl_id}")
+              print(f"rule_number: {rule_number}")
+              print(f"attacker_ip: {attacker_ip}")
+              print(f"instance_id: {instance_id}")
+              print(f"subnet_id: {subnet_id}")
+              print(f"event: {event}")
+              print("--------------------------------")
 
-              # Dynamically find an available rule number (starts at 100)
-              nacls = ec2.describe_network_acls(NetworkAclIds=[nacl_id])['NetworkAcls']
-              existing_rules = [entry['RuleNumber'] for entry in nacls[0]['Entries']]
-              rule_number = next(i for i in range(100, 32766) if i not in existing_rules)
+              if not ip_already_blocked(nacl_id, attacker_ip):
+                ec2.create_network_acl_entry(
+                    NetworkAclId=nacl_id,
+                    RuleNumber=rule_number,
+                    Protocol='6',  # TCP
+                    RuleAction='deny',
+                    Egress=False,
+                    CidrBlock=f"{attacker_ip}/32",
+                    PortRange={'From': 22, 'To': 22}
+                )
 
-              ec2.create_network_acl_entry(
-                  NetworkAclId=nacl_id,
-                  RuleNumber=rule_number,
-                  Protocol='6',  # TCP
-                  RuleAction='deny',
-                  Egress=False,
-                  CidrBlock=f"{ip}/32",
-                  PortRange={
-                      'From': 22,
-                      'To': 22
-                  }
-              )
+              if not ip_already_blocked(nacl_id, target_ip):
+                ec2.create_network_acl_entry(
+                    NetworkAclId=nacl_id,
+                    RuleNumber=rule_number,
+                    Protocol='6',  # TCP
+                    RuleAction='deny',
+                    Egress=True,
+                    CidrBlock=f"{target_ip}/32",
+                    PortRange={'From': 22, 'To': 22}
+                )
 
-              message = f"GuardDuty detected SSH brute force from {ip}. Blocked via NACL rule #{rule_number}."
+              message = f"GuardDuty detected SSH brute force from {attacker_ip}. Blocked via NACL {nacl_id}, rule {rule_number}."
               print(message)
+
               sns.publish(
                   TopicArn=os.environ['NOTIFICATION_TOPIC'],
                   Message=message,
