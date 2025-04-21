@@ -62,37 +62,73 @@ Resources:
           NOTIFICATION_TOPIC: !Ref NotificationTopic
       Code:
         ZipFile: |
-          import os, logging, boto3
+          import os
+          import logging
+          import boto3
           from botocore.config import Config
           from typing import Optional
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
+
           TARGET_SG = os.environ['TARGET_SG_ID']
           TOPIC_ARN = os.environ['NOTIFICATION_TOPIC']
+          PORT = 22
+          PROTOCOL = 'tcp'
+          OPEN_CIDR = '0.0.0.0/0'
+
           ec2 = boto3.client('ec2', config=Config(retries={'max_attempts': 8}))
           sns = boto3.client('sns')
-          PORT, PROTOCOL, OPEN_CIDR = 22, 'tcp', '0.0.0.0/0'
+
+          def attacker_ip(event) -> Optional[str]:
+              return (
+                  event.get('detail', {})
+                       .get('service', {})
+                       .get('action', {})
+                       .get('networkConnectionAction', {})
+                       .get('localIpDetails', {})
+                       .get('ipAddressV4')
+              )
+
+          def get_instance_info(event):
+              details = event.get("detail", {}).get("resource", {}).get("instanceDetails", {})
+              tags = {t['key']: t['value'] for t in details.get("tags", [])}
+              logger.info(f"Event: {event}")
+              logger.info(f"Instance tags: {tags}")
+              logger.info(f"Instance ID: {details.get('instanceId', 'N/A')}")
+              logger.info(f"VPC ID: {details.get('networkInterfaces', [{}])[0].get('vpcId', 'N/A')}")
+              logger.info(f"Region: {event.get('region', 'N/A')}")
+              
+              return {
+                  "instance_id": details.get("instanceId", "N/A"),
+                  "vpc_id": details.get("networkInterfaces", [{}])[0].get("vpcId", "N/A"),
+                  "region": event.get("region", "N/A")
+              }
+
+          def build_alert_message(attacker_ip, instance_info, sg_id):
+              return (
+                  f"🚨 GuardDuty SSH Brute Force Alert\n\n"
+                  f"Attacker IP: {attacker_ip}\n"
+                  f"Target Instance ID: {instance_info['instance_id']}\n"
+                  f"Region: {instance_info['region']}\n"
+                  f"VPC ID: {instance_info['vpc_id']}\n"
+                  f"Security Group Affected: {sg_id}\n"
+                  f"Action Taken: Removed 0.0.0.0/0 SSH rule from SG\n"
+                  f"Time: Automatically remediated by Lambda"
+              )
 
           def _respond(code: int, msg: str):
               logger.info(msg)
-              sns.publish(TopicArn=TOPIC_ARN,
-                          Subject=f'SSH Remediation {code}',
-                          Message=msg)
               return {'statusCode': code, 'body': msg}
-
-          def attacker_ip(event) -> Optional[str]:
-              return (event.get('detail', {})
-                          .get('service', {})
-                          .get('action', {})
-                          .get('networkConnectionAction', {})
-                          .get('remoteIpDetails', {})
-                          .get('ipAddressV4'))
 
           def lambda_handler(event, _):
               ip = attacker_ip(event)
               if not ip:
-                  return _respond(400, 'No IP in event')
+                  return _respond(400, 'No IP found in GuardDuty finding.')
+
+              instance_info = get_instance_info(event)
+              message = build_alert_message(ip, instance_info, TARGET_SG)
+
               try:
                   ec2.revoke_security_group_ingress(
                       GroupId=TARGET_SG,
@@ -103,15 +139,20 @@ Resources:
                           'IpRanges': [{'CidrIp': OPEN_CIDR}]
                       }]
                   )
-                  return _respond(200,
-                      f'Removed {OPEN_CIDR} rule from {TARGET_SG} (attacker {ip})'
+
+                  sns.publish(
+                      TopicArn=TOPIC_ARN,
+                      Subject='GuardDuty SSH Brute Force Alert',
+                      Message=message
                   )
+
+                  return _respond(200, f"✅ Remediation applied. Attacker: {ip}")
               except ec2.exceptions.ClientError as e:
                   if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
-                      return _respond(200, f'Rule already absent in {TARGET_SG}')
-                  return _respond(500, f'EC2 error: {e}')
+                      return _respond(200, f"⚠️ Rule already removed. Nothing to revoke for {TARGET_SG}")
+                  return _respond(500, f"EC2 error: {e}")
               except Exception as e:
-                  return _respond(500, f'Unexpected error: {e}')
+                  return _respond(500, f"Unexpected error: {e}")
 
 
   GuardDutyEventRule:
