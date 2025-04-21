@@ -36,6 +36,8 @@ Resources:
                   - ec2:RevokeSecurityGroupIngress
                   - ec2:DescribeSecurityGroups
                   - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:CreateTags
+                  - ec2:StopInstances
                 Resource: "*"
               - Effect: Allow
                 Action:
@@ -67,6 +69,7 @@ Resources:
           import boto3
           from botocore.config import Config
           from typing import Optional
+          from datetime import datetime
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
@@ -106,6 +109,7 @@ Resources:
               }
 
           def build_alert_message(attacker_ip, instance_info, sg_id):
+              now = datetime.utcnow().isoformat() + 'Z'
               return (
                   f"🚨 GuardDuty SSH Brute Force Alert\n\n"
                   f"Attacker IP: {attacker_ip}\n"
@@ -114,14 +118,14 @@ Resources:
                   f"VPC ID: {instance_info['vpc_id']}\n"
                   f"Security Group Affected: {sg_id}\n"
                   f"Action Taken: Removed 0.0.0.0/0 SSH rule from SG\n"
-                  f"Time: Automatically remediated by Lambda"
+                  f"Time: Automatically remediated by Lambda at {now}"
               )
 
           def _respond(code: int, msg: str):
               logger.info(msg)
               return {'statusCode': code, 'body': msg}
 
-          def lambda_handler(event, _):
+          def lambda_handler(event, context):
               ip = attacker_ip(event)
               if not ip:
                   return _respond(400, 'No IP found in GuardDuty finding.')
@@ -140,13 +144,28 @@ Resources:
                       }]
                   )
 
+                  # Tag and stop instance for forensics
+                  ec2.create_tags(
+                      Resources=[instance_info['instance_id']],
+                      Tags=[
+                          {'Key': 'Status', 'Value': 'Quarantined'},
+                          {'Key': 'RemediatedBy', 'Value': 'RemediationLambda'},
+                          {'Key': 'RemediatedAt', 'Value': now},
+                          {'Key': 'RemediationType', 'Value': 'SecurityGroupRevoke'}
+                      ]
+                  )
+
+                  ec2.stop_instances(
+                      InstanceIds=[instance_info['instance_id']]
+                  )
+
                   sns.publish(
                       TopicArn=TOPIC_ARN,
                       Subject='GuardDuty SSH Brute Force Alert',
                       Message=message
                   )
 
-                  return _respond(200, f"✅ Remediation applied. Attacker: {ip}")
+                  return _respond(200, f"✅ Remediation applied. Removed {OPEN_CIDR} rule from {TARGET_SG}, tagged and stopped instance {instance_info['instance_id']} (attacker {attacker_ip})")
               except ec2.exceptions.ClientError as e:
                   if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
                       return _respond(200, f"⚠️ Rule already removed. Nothing to revoke for {TARGET_SG}")
