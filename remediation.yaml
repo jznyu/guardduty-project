@@ -131,6 +131,7 @@ Resources:
                   return _respond(400, 'No IP found in GuardDuty finding.')
 
               instance_info = get_instance_info(event)
+              now = datetime.utcnow().isoformat() + 'Z'
               message = build_alert_message(ip, instance_info, TARGET_SG)
 
               try:
