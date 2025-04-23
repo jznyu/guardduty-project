@@ -173,42 +173,15 @@ Resources:
               except Exception as e:
                   return _respond(500, f"Unexpected error: {e}")
 
-
-  GuardDutyEventRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: SSHBruteForceRemediationRule
-      Description: Triggers Lambda and SNS on GuardDuty SSH brute force attacks
-      EventPattern:
-        source:
-          - aws.guardduty
-        detail-type:
-          - GuardDuty Finding
-        detail:
-          severity:
-            - numeric: [">", 5]
-          type:
-            - prefix: "UnauthorizedAccess:EC2/SSHBruteForce"
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt RemediationLambda.Arn
-          Id: SSHRemediationLambdaTarget
-        - Arn: !Ref NotificationTopic
-          Id: NotifySecurityTeam
-
-  RemediationInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref RemediationLambda
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt GuardDutyEventRule.Arn
-
 Outputs:
   LambdaFunctionArn:
     Description: ARN of the GuardDuty Remediation Lambda
     Value: !GetAtt RemediationLambda.Arn
+    Export:
+      Name: GuardDutyRemediationLambdaArn
 
   NotificationTopicArn:
     Description: ARN of the SNS Topic for Security Team Alerts
     Value: !Ref NotificationTopic
+    Export:
+      Name: GuardDutyNotificationTopicArn

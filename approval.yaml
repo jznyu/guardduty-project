@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: GuardDuty manual-approval workflow (API Gateway + Step Functions)
+
+Resources:
+  # IAM role that lets Lambda functions access DynamoDB and SNS
+  LambdaExecRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Principal: { Service: lambda.amazonaws.com }
+                Action: sts:AssumeRole
+          ManagedPolicyArns:
+            - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          Policies:
+            - PolicyName: DynamoSNS
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - dynamodb:PutItem
+                      - dynamodb:UpdateItem
+                      - dynamodb:GetItem
+                    Resource: !GetAtt ApprovalTable.Arn
+                  - Effect: Allow
+                    Action: sns:Publish
+                    Resource: !ImportValue GuardDutyNotificationTopicArn
+                  - Effect: Allow
+                    Action:
+                      - logs:CreateLogGroup
+                      - logs:CreateLogStream
+                      - logs:PutLogEvents
+                    Resource: "arn:aws:logs:*:*:*"
+
+  # IAM role that lets EventBridge start the Step Function
+  EventsToStepFunctionRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: events.amazonaws.com
+                Action: sts:AssumeRole
+          Policies:
+            - PolicyName: StartExecution
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action: states:StartExecution
+                    Resource: !Ref ApprovalStateMachine
+
+  # EventBridge rule that launches the approval workflow for GuardDuty SSH brute-force findings
+  GuardDutyApprovalRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: SSHBruteForceApprovalRule
+        Description: Triggers manual-approval workflow for GuardDuty SSH brute-force findings
+        EventPattern:
+          source: 
+            - aws.guardduty
+          detail-type: 
+            - GuardDuty Finding
+          detail:
+            severity:
+              - numeric: [ ">", 5 ]
+            type:
+              - prefix: "UnauthorizedAccess:EC2/SSHBruteForce"
+        State: ENABLED
+        Targets:
+          - Arn:  !Ref ApprovalStateMachine
+            Id:   GuardDutyApprovalWorkflow
+            RoleArn: !GetAtt EventsToStepFunctionRole.Arn
+
+  # DynamoDB table to store decisions
+  ApprovalTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: Token
+            AttributeType: S
+        KeySchema:
+          - AttributeName: Token
+            KeyType: HASH
+
+  # Lambda that parses the GuardDuty finding & sends email with links to approve/deny
+  ParseAndNotifyFn:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: guardduty-approval-ParseAndNotifyFn
+        Role: !GetAtt LambdaExecRole.Arn
+        Runtime: python3.9
+        Handler: index.handler
+        Timeout: 30
+        Environment:
+          Variables:
+            TABLE: !Ref ApprovalTable
+            TOPIC_ARN: !ImportValue GuardDutyNotificationTopicArn
+            API_BASE: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+        Code: 
+          ZipFile: |
+            import os, json, boto3, uuid
+            sns  = boto3.client('sns')
+            ddb  = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+            def handler(event, _):
+                print("Received GuardDuty event:")
+                print(json.dumps(event, indent=2))
+                finding = event['detail']
+                token   = str(uuid.uuid4())
+                # Pre-write a "PENDING" record the Step Fn can poll
+                ddb.put_item(Item={'Token': token, 'status': 'PENDING'})
+                approve = f"{os.environ['API_BASE']}/approve/{token}"
+                deny    = f"{os.environ['API_BASE']}/deny/{token}"
+                msg = (
+                  "🚨 GuardDuty SSH brute-force detected\n\n"
+                  f"Finding ID: {finding['id']}\n"
+                  f"Instance: {finding['resource']['instanceDetails']['instanceId']}\n\n"
+                  f"Approve remediation ➡ {approve}\n"
+                  f"Deny remediation ➡ {deny}"
+                )
+                sns.publish(TopicArn=os.environ['TOPIC_ARN'],
+                            Subject="Approval required: GuardDuty remediation",
+                            Message=msg)
+                return {'token': token, 'finding': finding}
+
+  # Lambda behind API Gateway — records "APPROVED" / "DENIED" in DynamoDB
+  DecisionFn:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: guardduty-approval-DecisionFn
+        Role: !GetAtt LambdaExecRole.Arn
+        Runtime: python3.9
+        Handler: index.handler
+        Environment:
+          Variables:
+            TABLE: !Ref ApprovalTable
+        Code: 
+          ZipFile: |
+            import os, boto3
+            table = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+            def handler(event, _):
+                token  = event['pathParameters']['token']
+                action = 'APPROVED' if 'approve' in event['rawPath'] else 'DENIED'
+                table.update_item(Key={'Token': token},
+                                  UpdateExpression="SET #s = :v",
+                                  ExpressionAttributeNames={'#s': 'status'},
+                                  ExpressionAttributeValues={':v': action})
+                return {"statusCode": 200,
+                        "headers": {"Content-Type": "text/html"},
+                        "body": f"<h1>Remediation {action}</h1>"}
+
+  # HTTP API with two routes (API Gateway v2)
+  HttpApi:
+      Type: AWS::ApiGatewayV2::Api
+      Properties:
+        Name: GuardDutyApprovalAPI
+        ProtocolType: HTTP
+
+  # Integration between API Gateway and DecisionFn
+  ApiIntegration:
+      Type: AWS::ApiGatewayV2::Integration
+      Properties:
+        ApiId: !Ref HttpApi
+        IntegrationType: AWS_PROXY
+        IntegrationUri: !GetAtt DecisionFn.Arn
+        PayloadFormatVersion: "2.0"
+
+  # Route for approving a finding
+  ApproveRoute:
+      Type: AWS::ApiGatewayV2::Route
+      Properties:
+        ApiId: !Ref HttpApi
+        RouteKey: "GET /approve/{token}"
+        Target: !Sub "integrations/${ApiIntegration}"
+
+  # Route for denying a finding
+  DenyRoute:
+      Type: AWS::ApiGatewayV2::Route
+      Properties:
+        ApiId: !Ref HttpApi
+        RouteKey: "GET /deny/{token}"
+        Target: !Sub "integrations/${ApiIntegration}"
+
+  # Permission for API Gateway to invoke DecisionFn
+  HttpApiPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt DecisionFn.Arn
+        Action: lambda:InvokeFunction
+        Principal: apigateway.amazonaws.com
+        SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*"
+
+  # Step Function: parse → wait → check decision → remediate / exit
+  ApprovalStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: GuardDutyManualApproval
+        RoleArn: !GetAtt SfRole.Arn
+        DefinitionString:
+          Fn::Sub: 
+          - |
+            {
+              "StartAt": "ParseAndNotify",
+              "TimeoutSeconds": 900,
+              "States": {
+                "ParseAndNotify": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${ParseAndNotifyFn.Arn}",
+                    "Payload.$": "$"
+                  },
+                  "ResultPath": "$.parse",
+                  "Next": "Wait5Min"
+                },
+                "Wait5Min": {
+                  "Type": "Wait",
+                  "Seconds": 300,
+                  "Next": "CheckDecision"
+                },
+                "CheckDecision": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${CheckDecisionFn.Arn}",
+                    "Payload.$": "$"
+                  },
+                  "ResultPath": "$.decision",
+                  "Next": "Approved?"
+                },
+                "Approved?": {
+                  "Type": "Choice",
+                  "Choices": [
+                    { "Variable": "$.decision.Payload.status", "StringEquals": "APPROVED", "Next": "Remediate" },
+                    { "Variable": "$.decision.Payload.status", "StringEquals": "DENIED", "Next": "Exit" }
+                  ],
+                  "Default": "Wait5Min"
+                },
+                "Remediate": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${RemediationLambdaArn}",
+                    "Payload.$": "$"
+                  },
+                  "End": true
+                },
+                "Exit": { "Type": "Succeed" }
+              }
+            }
+          - { RemediationLambdaArn: !ImportValue GuardDutyRemediationLambdaArn}
+
+  # Lambda to read decisions from DynamoDB
+  CheckDecisionFn:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: guardduty-approval-CheckDecisionFn
+        Role: !GetAtt LambdaExecRole.Arn
+        Runtime: python3.9
+        Handler: index.handler
+        Environment:
+          Variables:
+            TABLE: !Ref ApprovalTable
+        Code: 
+          ZipFile: |
+            import os, boto3, json
+            ddb = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+            def handler(event, _):
+                token = event['parse']['Payload']['token']
+                item  = ddb.get_item(Key={'Token': token}).get('Item', {})
+                print("DecisionFn:")
+                print("Received event:", json.dumps(event, indent=2))
+                print("Item:", json.dumps(item, indent=2))
+                return {"status": item.get('status', 'PENDING')}
+
+  # IAM role for Step Functions to call Lambdas
+  SfRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: { Service: states.amazonaws.com }
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: CallLambdas
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource:
+                    - !GetAtt ParseAndNotifyFn.Arn
+                    - !GetAtt CheckDecisionFn.Arn
+                    - !ImportValue GuardDutyRemediationLambdaArn
+
+  # API Stage deployment
+  ApiStage:
+      Type: AWS::ApiGatewayV2::Stage
+      Properties:
+        ApiId: !Ref HttpApi
+        StageName: $default
+        AutoDeploy: true
+
+Outputs:
+    ApprovalStateMachine:
+      Value: !Ref ApprovalStateMachine
+      Export: { Name: ApprovalStateMachine }
